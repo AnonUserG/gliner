@@ -55,10 +55,10 @@ docker build --platform linux/amd64 -t ner-gliner:1.0 .
 
 ```bash
 # На машине со сборкой
-docker save ner-gliner:1.0 | gzip > ner-gliner.tar.gz
+docker save ner-gliner:1.0 -o ner-gliner.tar
 
 # На целевой машине
-gunzip -c ner-gliner.tar.gz | docker load
+docker load -i ner-gliner.tar
 ```
 
 ---
@@ -177,6 +177,54 @@ curl -X POST http://localhost:8000/extract_batch \
   -H "Content-Type: application/json" \
   -d '{"texts":["Angela Merkel visited Berlin.","Barack Obama is from Chicago."],"labels":["person","city"]}'
 ```
+
+---
+
+## Примеры меток (labels)
+
+Модель zero-shot — метки задаются произвольно на английском. Ниже распространённые наборы:
+
+| Категория | Пример labels |
+|---|---|
+| Люди и места | `["person", "city", "country"]` |
+| Организации | `["person", "organization", "location"]` |
+| Время и события | `["person", "date", "event"]` |
+| Бизнес и финансы | `["company", "product", "currency", "price"]` |
+| Медицина | `["disease", "drug", "symptom", "doctor"]` |
+| Новости / СМИ | `["person", "organization", "location", "date", "phone number", "email"]` |
+| Вакансии / резюме | `["person", "job title", "company", "skill", "city"]` |
+| Юридические тексты | `["person", "organization", "law", "date", "court"]` |
+
+> Метки лучше задавать **по-английски** — модель точнее и стабильнее с английскими токенами меток, даже если сам текст на другом языке.
+
+### Пример: мониторинг СМИ
+
+Извлечение персон, локаций, организаций, контактов и упоминаний конкретной компании (здесь — `"Газпром"`).  
+Название нужной организации передаётся как отдельная метка — модель найдёт только её упоминания.
+
+```json
+{
+  "text": "Представитель Газпрома Иван Петров сообщил, что компания открыла офис в Екатеринбурге. По вопросам сотрудничества: +7 (495) 719-30-01, press@gazprom.ru",
+  "labels": ["person", "organization", "location", "phone number", "email", "Газпром"],
+  "threshold": 0.3
+}
+```
+
+Ожидаемый результат:
+
+```json
+{
+  "entities": [
+    {"text": "Газпрома",     "label": "Газпром",      "start": 14, "end": 22, "score": 0.91},
+    {"text": "Иван Петров",  "label": "person",       "start": 23, "end": 34, "score": 0.97},
+    {"text": "Екатеринбурге","label": "location",     "start": 71, "end": 84, "score": 0.95},
+    {"text": "+7 (495) 719-30-01", "label": "phone number", "start": 114, "end": 132, "score": 0.88},
+    {"text": "press@gazprom.ru",   "label": "email",        "start": 134, "end": 150, "score": 0.93}
+  ]
+}
+```
+
+> **Метка = название организации** — удобно когда нужно отслеживать упоминания конкретного бренда или компании отдельно от всех остальных организаций в тексте.
 
 ---
 

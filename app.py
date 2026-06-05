@@ -1,7 +1,7 @@
 import time
 import logging
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
@@ -13,6 +13,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 MODEL_NAME = "urchade/gliner_multi-v2.1"
+MAX_TEXT_LENGTH = 10_000  # characters; protects against OOM on very long inputs
 
 model: Optional[Any] = None
 model_loaded: bool = False
@@ -44,7 +45,7 @@ app = FastAPI(title="GLiNER NER Service", version="1.0.0", lifespan=lifespan)
 # ---------------------------------------------------------------------------
 
 class ExtractRequest(BaseModel):
-    text: str
+    text: str = Field(max_length=MAX_TEXT_LENGTH)
     labels: list[str] = Field(..., min_length=1)
     threshold: float = Field(default=0.5, ge=0.0, le=1.0)
 
@@ -62,7 +63,7 @@ class ExtractResponse(BaseModel):
 
 
 class ExtractBatchRequest(BaseModel):
-    texts: list[str]
+    texts: list[Annotated[str, Field(max_length=MAX_TEXT_LENGTH)]]
     labels: list[str] = Field(..., min_length=1)
     threshold: float = Field(default=0.5, ge=0.0, le=1.0)
 
