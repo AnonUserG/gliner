@@ -1,0 +1,8 @@
+# torch is installed separately from the CPU wheel index — see Dockerfile:
+#   pip install torch==2.1.2 --index-url https://download.pytorch.org/whl/cpu
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+pydantic==2.6.1
+gliner==0.2.7
+transformers==4.38.2
+huggingface-hub==0.21.4

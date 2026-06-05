@@ -1,0 +1,17 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+venv
+.venv
+env
+*.tar
+*.tar.gz
+*.egg-info
+dist
+build
+README.md
+requirements-dev.txt
