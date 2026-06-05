@@ -194,8 +194,16 @@ curl -X POST http://localhost:8000/extract_batch \
 | Новости / СМИ | `["person", "organization", "location", "date", "phone number", "email"]` |
 | Вакансии / резюме | `["person", "job title", "company", "skill", "city"]` |
 | Юридические тексты | `["person", "organization", "law", "date", "court"]` |
+| Недвижимость | `["property type", "location", "price", "area", "developer"]` |
+| Спорт | `["athlete", "team", "sport", "tournament", "score"]` |
+| Логистика | `["sender", "recipient", "address", "tracking number", "cargo"]` |
+| Модерация контента | `["insult", "threat", "profanity", "hate speech"]` |
 
 > Метки лучше задавать **по-английски** — модель точнее и стабильнее с английскими токенами меток, даже если сам текст на другом языке.
+>
+> **Важно:** GLiNER извлекает конкретные *фрагменты* текста. Метки вида `"негативный текст"` или `"токсичный отзыв"` работают плохо — это характеристика всего текста, а не выделяемого span'а. Для классификации тональности используйте отдельные модели. Вместо этого используйте конкретные метки: `"insult"`, `"threat"`, `"profanity"`.
+
+---
 
 ### Пример: мониторинг СМИ
 
@@ -215,16 +223,98 @@ curl -X POST http://localhost:8000/extract_batch \
 ```json
 {
   "entities": [
-    {"text": "Газпрома",     "label": "Газпром",      "start": 14, "end": 22, "score": 0.91},
-    {"text": "Иван Петров",  "label": "person",       "start": 23, "end": 34, "score": 0.97},
-    {"text": "Екатеринбурге","label": "location",     "start": 71, "end": 84, "score": 0.95},
-    {"text": "+7 (495) 719-30-01", "label": "phone number", "start": 114, "end": 132, "score": 0.88},
-    {"text": "press@gazprom.ru",   "label": "email",        "start": 134, "end": 150, "score": 0.93}
+    {"text": "Газпрома",          "label": "Газпром",      "start": 14,  "end": 22,  "score": 0.91},
+    {"text": "Иван Петров",       "label": "person",       "start": 23,  "end": 34,  "score": 0.97},
+    {"text": "Екатеринбурге",     "label": "location",     "start": 71,  "end": 84,  "score": 0.95},
+    {"text": "+7 (495) 719-30-01","label": "phone number", "start": 114, "end": 132, "score": 0.88},
+    {"text": "press@gazprom.ru",  "label": "email",        "start": 134, "end": 150, "score": 0.93}
   ]
 }
 ```
 
 > **Метка = название организации** — удобно когда нужно отслеживать упоминания конкретного бренда или компании отдельно от всех остальных организаций в тексте.
+
+---
+
+### Пример: модерация контента
+
+Поиск конкретных токсичных фраз и угроз в пользовательских сообщениях.
+
+```json
+{
+  "text": "Ты полный идиот, я тебя найду и тебе не поздоровится. Убирайся отсюда.",
+  "labels": ["insult", "threat", "profanity"],
+  "threshold": 0.3
+}
+```
+
+Ожидаемый результат:
+
+```json
+{
+  "entities": [
+    {"text": "полный идиот",                    "label": "insult",   "start": 3,  "end": 15, "score": 0.89},
+    {"text": "я тебя найду и тебе не поздоровится", "label": "threat", "start": 17, "end": 52, "score": 0.84}
+  ]
+}
+```
+
+---
+
+### Пример: недвижимость
+
+Извлечение параметров объекта из текста объявления.
+
+```json
+{
+  "text": "Продаётся 2-комнатная квартира 58 кв.м в ЖК Олимп, Казань, застройщик ПИК. Цена 4 500 000 руб.",
+  "labels": ["property type", "area", "location", "developer", "price"],
+  "threshold": 0.3
+}
+```
+
+Ожидаемый результат:
+
+```json
+{
+  "entities": [
+    {"text": "2-комнатная квартира", "label": "property type", "start": 10, "end": 30, "score": 0.93},
+    {"text": "58 кв.м",             "label": "area",          "start": 31, "end": 38, "score": 0.91},
+    {"text": "Казань",              "label": "location",      "start": 51, "end": 57, "score": 0.96},
+    {"text": "ПИК",                 "label": "developer",     "start": 71, "end": 74, "score": 0.88},
+    {"text": "4 500 000 руб.",      "label": "price",         "start": 82, "end": 96, "score": 0.90}
+  ]
+}
+```
+
+---
+
+### Пример: вакансии и резюме
+
+Парсинг ключевых данных из текста резюме или объявления о вакансии.
+
+```json
+{
+  "text": "Иван Сидоров, senior Python developer, 8 лет опыта. Работал в Яндексе и Сбере. Ищу позицию в Москве или удалённо.",
+  "labels": ["person", "job title", "skill", "company", "location"],
+  "threshold": 0.3
+}
+```
+
+Ожидаемый результат:
+
+```json
+{
+  "entities": [
+    {"text": "Иван Сидоров",          "label": "person",    "start": 0,  "end": 12, "score": 0.97},
+    {"text": "senior Python developer","label": "job title", "start": 14, "end": 36, "score": 0.92},
+    {"text": "Python",                "label": "skill",     "start": 21, "end": 27, "score": 0.88},
+    {"text": "Яндексе",               "label": "company",   "start": 62, "end": 69, "score": 0.94},
+    {"text": "Сбере",                 "label": "company",   "start": 72, "end": 77, "score": 0.91},
+    {"text": "Москве",                "label": "location",  "start": 95, "end": 101,"score": 0.95}
+  ]
+}
+```
 
 ---
 
