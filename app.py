@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import logging
 from contextlib import asynccontextmanager
@@ -29,6 +30,17 @@ DEFAULT_THRESHOLD = float(os.environ.get("DEFAULT_THRESHOLD", "0.5"))
 # container start so the image rarely needs rebuilding.
 MAX_TEXT_LENGTH = _env_int("MAX_TEXT_LENGTH")
 MAX_BATCH_SIZE = _env_int("MAX_BATCH_SIZE")
+
+# GLiNER's underlying span model truncates each input to `config.max_len`
+# "words" (default 384), silently dropping anything beyond that — see
+# gliner/data_processing/processor.py. To support arbitrarily long texts
+# without losing entities, long texts are split into word-chunks and the
+# per-chunk results are merged back using the original character offsets.
+CHUNK_SIZE_WORDS = int(os.environ.get("CHUNK_SIZE_WORDS", "300"))
+
+# Mirrors gliner's default WhitespaceTokenSplitter so a "word" here lines up
+# with what the model counts towards `config.max_len`.
+_WORD_PATTERN = re.compile(r"\w+(?:[-_]\w+)*|\S")
 
 model: Optional[Any] = None
 model_loaded: bool = False
@@ -114,6 +126,92 @@ def _format_entities(raw: list[dict]) -> list[Entity]:
     ]
 
 
+def _chunk_text(text: str, chunk_size: int) -> list[tuple[int, int]]:
+    """Split `text` into chunks of up to `chunk_size` words.
+
+    Returns a list of (start, end) character offsets into `text`, one per
+    chunk. Chunks are non-overlapping and cover the whole text; a chunk's
+    substring is `text[start:end]`.
+    """
+    words = list(_WORD_PATTERN.finditer(text))
+    if not words:
+        return [(0, len(text))]
+
+    chunks = []
+    for i in range(0, len(words), chunk_size):
+        group = words[i : i + chunk_size]
+        chunks.append((group[0].start(), group[-1].end()))
+    return chunks
+
+
+def _predict_entities(texts: list[str], labels: list[str], threshold: float) -> list[list[dict]]:
+    try:
+        return model.batch_predict_entities(texts, labels, threshold=threshold)
+    except AttributeError:
+        # fallback for older gliner versions without batch API
+        return [model.predict_entities(text, labels, threshold=threshold) for text in texts]
+
+
+def _extract_entities(texts: list[str], labels: list[str], threshold: float) -> list[list[dict]]:
+    """Extract entities for each text, transparently chunking long texts.
+
+    Texts longer than CHUNK_SIZE_WORDS words are split into chunks, each
+    chunk is run through the model independently, and the resulting
+    entities are merged back with their `start`/`end` offsets translated to
+    positions in the original text. All chunks across all input texts are
+    sent to the model in a single batched call.
+    """
+    chunk_texts: list[str] = []
+    # one entry per chunk, in the same order as chunk_texts
+    chunk_owner: list[tuple[int, int]] = []  # (text_index, char_offset)
+    chunk_counts: list[int] = [0] * len(texts)
+
+    for text_idx, text in enumerate(texts):
+        if not text:
+            continue
+        spans = _chunk_text(text, CHUNK_SIZE_WORDS)
+        chunk_counts[text_idx] = len(spans)
+        if len(spans) > 1:
+            word_count = len(_WORD_PATTERN.findall(text))
+            logger.info(
+                "Text %d: %d words (%d chars) exceeds chunk size %d — split into %d chunks",
+                text_idx, word_count, len(text), CHUNK_SIZE_WORDS, len(spans),
+            )
+        for start, end in spans:
+            chunk_texts.append(text[start:end])
+            chunk_owner.append((text_idx, start))
+
+    results: list[list[dict]] = [[] for _ in texts]
+    if not chunk_texts:
+        return results
+
+    raw_chunks = _predict_entities(chunk_texts, labels, threshold)
+
+    chunk_seen = [0] * len(texts)
+    for (text_idx, offset), chunk_text, chunk_entities in zip(chunk_owner, chunk_texts, raw_chunks):
+        for entity in chunk_entities:
+            entity["start"] += offset
+            entity["end"] += offset
+        results[text_idx].extend(chunk_entities)
+
+        if chunk_counts[text_idx] > 1:
+            chunk_seen[text_idx] += 1
+            logger.info(
+                "Text %d chunk %d/%d (offset %d, %d chars): extracted %d entities",
+                text_idx, chunk_seen[text_idx], chunk_counts[text_idx],
+                offset, len(chunk_text), len(chunk_entities),
+            )
+
+    for text_idx, count in enumerate(chunk_counts):
+        if count > 1:
+            logger.info(
+                "Text %d: merged %d entities from %d chunks",
+                text_idx, len(results[text_idx]), count,
+            )
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -129,7 +227,7 @@ def extract(req: ExtractRequest):
         return ExtractResponse(entities=[])
 
     t0 = time.time()
-    raw = model.predict_entities(req.text, req.labels, threshold=req.threshold)
+    raw = _extract_entities([req.text], req.labels, req.threshold)[0]
     logger.debug("Inference /extract: %.3f s, %d entities", time.time() - t0, len(raw))
 
     return ExtractResponse(entities=_format_entities(raw))
@@ -141,16 +239,7 @@ def extract_batch(req: ExtractBatchRequest):
         return ExtractBatchResponse(results=[])
 
     t0 = time.time()
-    try:
-        raw_batch = model.batch_predict_entities(
-            req.texts, req.labels, threshold=req.threshold
-        )
-    except AttributeError:
-        # fallback for older gliner versions without batch API
-        raw_batch = [
-            model.predict_entities(text, req.labels, threshold=req.threshold)
-            for text in req.texts
-        ]
+    raw_batch = _extract_entities(req.texts, req.labels, req.threshold)
     logger.debug(
         "Inference /extract_batch: %.3f s, %d texts",
         time.time() - t0,
