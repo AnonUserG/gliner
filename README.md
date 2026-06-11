@@ -75,13 +75,26 @@ docker run -d -p 8000:8000 --name ner-gliner ner-gliner:1.0
 docker run --rm --network none -p 8000:8000 ner-gliner:1.0
 ```
 
-### Параметр числа воркеров
+### Переменные окружения
 
-Каждый воркер uvicorn держит **отдельную копию модели** (~1.5 GB RAM каждая).
-По умолчанию `WORKERS=1`.
+Все параметры ниже задаются через `-e` при запуске контейнера — пересборка образа не требуется.
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `WORKERS` | `1` | Число воркеров uvicorn. Каждый держит **отдельную копию модели** (~1.5 GB RAM). |
+| `MODEL_NAME` | `urchade/gliner_multi-v2.1` | Имя модели для `GLiNER.from_pretrained`. При смене модели на офлайн-машине (`HF_HUB_OFFLINE=1`) веса должны быть уже доступны (запечены в образ или закэшированы). |
+| `MAX_TEXT_LENGTH` | не задано (без ограничений) | Максимальная длина `text` / элемента `texts` в символах. Запрос с более длинным текстом вернёт `422`. |
+| `MAX_BATCH_SIZE` | не задано (без ограничений) | Максимальное число элементов в `texts` для `/extract_batch`. |
+| `DEFAULT_THRESHOLD` | `0.5` | Значение `threshold`, если оно не передано в запросе. |
+| `LOG_LEVEL` | `INFO` | Уровень логирования (`DEBUG`, `INFO`, `WARNING`, ...). |
 
 ```bash
-docker run -d -p 8000:8000 -e WORKERS=2 --name ner-gliner ner-gliner:1.0
+docker run -d -p 8000:8000 \
+  -e WORKERS=2 \
+  -e MAX_TEXT_LENGTH=10000 \
+  -e MAX_BATCH_SIZE=100 \
+  -e DEFAULT_THRESHOLD=0.3 \
+  --name ner-gliner ner-gliner:1.0
 ```
 
 ---

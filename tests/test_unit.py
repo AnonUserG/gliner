@@ -46,15 +46,9 @@ class TestExtractValidation:
         resp = client.post("/extract", json={"labels": ["person"]})
         assert resp.status_code == 422
 
-    def test_text_too_long(self, client):
+    def test_long_text_accepted_when_no_limit_configured(self, client):
         resp = client.post(
-            "/extract", json={"text": "x" * 10_001, "labels": ["person"]}
-        )
-        assert resp.status_code == 422
-
-    def test_text_at_max_length_is_accepted(self, client):
-        resp = client.post(
-            "/extract", json={"text": "x" * 10_000, "labels": ["person"]}
+            "/extract", json={"text": "x" * 50_000, "labels": ["person"]}
         )
         assert resp.status_code == 200
 
@@ -122,12 +116,21 @@ class TestBatchValidation:
         assert resp.status_code == 200
         assert resp.json()["results"] == []
 
-    def test_one_text_too_long_rejects_whole_batch(self, client):
+    def test_long_text_in_batch_accepted_when_no_limit_configured(self, client, mock_model):
+        mock_model.batch_predict_entities.return_value = [[], []]
         resp = client.post(
             "/extract_batch",
-            json={"texts": ["ok text", "x" * 10_001], "labels": ["person"]},
+            json={"texts": ["ok text", "x" * 50_000], "labels": ["person"]},
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 200
+
+    def test_large_batch_accepted_when_no_limit_configured(self, client, mock_model):
+        texts = ["text"] * 1000
+        mock_model.batch_predict_entities.return_value = [[] for _ in texts]
+        resp = client.post(
+            "/extract_batch", json={"texts": texts, "labels": ["person"]}
+        )
+        assert resp.status_code == 200
 
 
 # ---------------------------------------------------------------------------

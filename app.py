@@ -1,3 +1,4 @@
+import os
 import time
 import logging
 from contextlib import asynccontextmanager
@@ -6,14 +7,28 @@ from typing import Annotated, Any, Optional
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s %(name)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "urchade/gliner_multi-v2.1"
-MAX_TEXT_LENGTH = 10_000  # characters; protects against OOM on very long inputs
+
+def _env_int(name: str) -> Optional[int]:
+    """Read an optional positive-int env var; unset/empty means unlimited."""
+    value = os.environ.get(name)
+    return int(value) if value else None
+
+
+MODEL_NAME = os.environ.get("MODEL_NAME", "urchade/gliner_multi-v2.1")
+DEFAULT_THRESHOLD = float(os.environ.get("DEFAULT_THRESHOLD", "0.5"))
+
+# Optional limits — unset/empty env var means unlimited. Configurable at
+# container start so the image rarely needs rebuilding.
+MAX_TEXT_LENGTH = _env_int("MAX_TEXT_LENGTH")
+MAX_BATCH_SIZE = _env_int("MAX_BATCH_SIZE")
 
 model: Optional[Any] = None
 model_loaded: bool = False
@@ -47,7 +62,7 @@ app = FastAPI(title="GLiNER NER Service", version="1.0.0", lifespan=lifespan)
 class ExtractRequest(BaseModel):
     text: str = Field(max_length=MAX_TEXT_LENGTH)
     labels: list[str] = Field(..., min_length=1)
-    threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    threshold: float = Field(default=DEFAULT_THRESHOLD, ge=0.0, le=1.0)
 
 
 class Entity(BaseModel):
@@ -63,9 +78,11 @@ class ExtractResponse(BaseModel):
 
 
 class ExtractBatchRequest(BaseModel):
-    texts: list[Annotated[str, Field(max_length=MAX_TEXT_LENGTH)]]
+    texts: list[Annotated[str, Field(max_length=MAX_TEXT_LENGTH)]] = Field(
+        ..., max_length=MAX_BATCH_SIZE
+    )
     labels: list[str] = Field(..., min_length=1)
-    threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    threshold: float = Field(default=DEFAULT_THRESHOLD, ge=0.0, le=1.0)
 
 
 class ExtractBatchResponse(BaseModel):
