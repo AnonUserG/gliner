@@ -4,7 +4,7 @@ Run with:  pytest -m "not integration"
 """
 import logging
 
-from app import _chunk_text
+from app import _chunk_text, _clean_labels, _clean_text
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +54,20 @@ class TestExtractValidation:
             "/extract", json={"text": "x" * 50_000, "labels": ["person"]}
         )
         assert resp.status_code == 200
+
+    def test_large_labels_list_accepted_when_no_limit_configured(self, client, mock_model):
+        labels = [f"label{i}" for i in range(1000)]
+        mock_model.batch_predict_entities.return_value = [[]]
+        resp = client.post(
+            "/extract", json={"text": "hello", "labels": labels}
+        )
+        assert resp.status_code == 200
+
+    def test_whitespace_only_labels_rejected(self, client):
+        resp = client.post(
+            "/extract", json={"text": "hello", "labels": ["  ", "\t"]}
+        )
+        assert resp.status_code == 422
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +224,141 @@ class TestChunkText:
 
 
 # ---------------------------------------------------------------------------
+# _clean_text — pure helper
+# ---------------------------------------------------------------------------
+
+class TestCleanText:
+    def test_strips_html_tags(self):
+        assert _clean_text("<b>Hello</b> world") == "Hello world"
+
+    def test_strips_tags_without_joining_adjacent_words(self):
+        assert _clean_text("Hello<br/>World") == "Hello World"
+
+    def test_decodes_html_entities(self):
+        assert _clean_text("Tom &amp; Jerry") == "Tom & Jerry"
+
+    def test_decodes_entities_that_spell_out_tags(self):
+        assert _clean_text("&lt;b&gt;Hello&lt;/b&gt;") == "Hello"
+
+    def test_collapses_whitespace_and_strips(self):
+        assert _clean_text("  Hello   world  \n\n") == "Hello world"
+
+    def test_nbsp_becomes_regular_space(self):
+        assert _clean_text("Hello" + chr(0xA0) + "World") == "Hello World"
+
+    def test_removes_zero_width_chars(self):
+        text = "Hello" + chr(0x200B) + chr(0x200C) + chr(0x200D) + "World"
+        assert _clean_text(text) == "HelloWorld"
+
+    def test_removes_control_chars_bom_and_soft_hyphen(self):
+        text = chr(0xFEFF) + "Hello" + chr(0xAD) + "World" + chr(0x00)
+        assert _clean_text(text) == "HelloWorld"
+
+    def test_nfkc_normalizes_fullwidth_chars(self):
+        fullwidth_abc = chr(0xFF21) + chr(0xFF22) + chr(0xFF23)
+        assert _clean_text(fullwidth_abc) == "ABC"
+
+    def test_empty_input(self):
+        assert _clean_text("") == ""
+
+    def test_whitespace_only_input_becomes_empty(self):
+        assert _clean_text("   \n\t  ") == ""
+
+
+# ---------------------------------------------------------------------------
+# Text cleaning — /extract and /extract_batch
+# ---------------------------------------------------------------------------
+
+class TestCleanTextIntegration:
+    def test_extract_cleans_text_before_inference(self, client, mock_model):
+        mock_model.batch_predict_entities.return_value = [[]]
+        resp = client.post(
+            "/extract",
+            json={"text": "<p>Angela&nbsp;Merkel</p>", "labels": ["person"]},
+        )
+        assert resp.status_code == 200
+        sent_texts = mock_model.batch_predict_entities.call_args[0][0]
+        assert sent_texts == ["Angela Merkel"]
+
+    def test_extract_returns_empty_for_text_that_cleans_to_empty(self, client):
+        resp = client.post("/extract", json={"text": "<br/>", "labels": ["person"]})
+        assert resp.status_code == 200
+        assert resp.json()["entities"] == []
+
+    def test_extract_batch_cleans_each_text(self, client, mock_model):
+        mock_model.batch_predict_entities.return_value = [[], []]
+        resp = client.post(
+            "/extract_batch",
+            json={"texts": ["<b>Hello</b>", "World &amp; Co"], "labels": ["person"]},
+        )
+        assert resp.status_code == 200
+        sent_texts = mock_model.batch_predict_entities.call_args[0][0]
+        assert sent_texts == ["Hello", "World & Co"]
+
+
+# ---------------------------------------------------------------------------
+# _clean_labels — pure helper
+# ---------------------------------------------------------------------------
+
+class TestCleanLabels:
+    def test_strips_whitespace(self):
+        assert _clean_labels([" person ", "city"]) == ["person", "city"]
+
+    def test_deduplicates_preserving_order(self):
+        assert _clean_labels(["person", "city", "person"]) == ["person", "city"]
+
+    def test_deduplicates_after_stripping(self):
+        assert _clean_labels(["person", " person "]) == ["person"]
+
+    def test_drops_empty_and_whitespace_only_entries(self):
+        assert _clean_labels(["person", "  ", "", "city"]) == ["person", "city"]
+
+    def test_all_empty_returns_empty_list(self):
+        assert _clean_labels(["  ", ""]) == []
+
+    def test_is_case_sensitive(self):
+        assert _clean_labels(["city", "City"]) == ["city", "City"]
+
+
+# ---------------------------------------------------------------------------
+# Labels cleaning — /extract and /extract_batch
+# ---------------------------------------------------------------------------
+
+class TestCleanLabelsIntegration:
+    def test_duplicate_and_whitespace_labels_collapse(self, client, mock_model):
+        mock_model.batch_predict_entities.return_value = [[]]
+        resp = client.post(
+            "/extract",
+            json={"text": "Angela Merkel", "labels": ["person", " person ", "person"]},
+        )
+        assert resp.status_code == 200
+        sent_labels = mock_model.batch_predict_entities.call_args[0][1]
+        assert sent_labels == ["person"]
+
+    def test_batch_duplicate_labels_collapse(self, client, mock_model):
+        mock_model.batch_predict_entities.return_value = [[], []]
+        resp = client.post(
+            "/extract_batch",
+            json={"texts": ["a", "b"], "labels": ["city", "person", "city"]},
+        )
+        assert resp.status_code == 200
+        sent_labels = mock_model.batch_predict_entities.call_args[0][1]
+        assert sent_labels == ["city", "person"]
+
+    def test_extract_whitespace_only_labels_rejected(self, client):
+        resp = client.post(
+            "/extract", json={"text": "hello", "labels": ["  ", "\n"]}
+        )
+        assert resp.status_code == 422
+
+    def test_extract_batch_whitespace_only_labels_rejected(self, client):
+        resp = client.post(
+            "/extract_batch", json={"texts": ["hello"], "labels": ["  ", "\n"]}
+        )
+        assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
 # Long-text chunking — /extract and /extract_batch
 # ---------------------------------------------------------------------------
 
@@ -291,12 +440,130 @@ class TestChunking:
         assert "chunk 1/3" in caplog.text
         assert "chunk 2/3" in caplog.text
         assert "chunk 3/3" in caplog.text
-        assert "merged 0 entities from 3 chunks" in caplog.text
+        assert "0 entities found from 3 chunk(s)" in caplog.text
 
-    def test_short_text_does_not_log_chunking(self, client, mock_model, caplog):
+    def test_short_text_does_not_log_multi_chunk_details(self, client, mock_model, caplog):
         with caplog.at_level(logging.INFO):
             resp = client.post("/extract", json={"text": "short text", "labels": ["person"]})
 
         assert resp.status_code == 200
-        assert "split into" not in caplog.text
-        assert "chunk" not in caplog.text
+        assert "exceeds chunk size" not in caplog.text
+        assert "chunk 1/" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# _predict_entities — batch API fallback
+# ---------------------------------------------------------------------------
+
+class TestPredictEntitiesFallback:
+    def test_falls_back_to_predict_entities_when_batch_api_missing(self, monkeypatch):
+        import app as app_module
+
+        class OldModel:
+            def predict_entities(self, text, labels, threshold=0.5):
+                return [{"text": text, "label": labels[0], "start": 0, "end": len(text), "score": 0.9}]
+
+        monkeypatch.setattr(app_module, "model", OldModel())
+
+        result = app_module._predict_entities(["hello", "world"], ["person"], 0.5)
+
+        assert result == [
+            [{"text": "hello", "label": "person", "start": 0, "end": 5, "score": 0.9}],
+            [{"text": "world", "label": "person", "start": 0, "end": 5, "score": 0.9}],
+        ]
+
+    def test_uses_batch_api_when_available(self, mock_model, monkeypatch):
+        import app as app_module
+        monkeypatch.setattr(app_module, "model", mock_model)
+
+        app_module._predict_entities(["hello"], ["person"], 0.5)
+
+        mock_model.batch_predict_entities.assert_called_once()
+        mock_model.predict_entities.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Inference error handling — /extract and /extract_batch
+# ---------------------------------------------------------------------------
+
+class TestInferenceErrorHandling:
+    def test_extract_returns_502_on_model_error(self, client, mock_model, caplog):
+        mock_model.batch_predict_entities.side_effect = RuntimeError("boom")
+
+        with caplog.at_level(logging.ERROR):
+            resp = client.post("/extract", json={"text": "Angela Merkel", "labels": ["person"]})
+
+        assert resp.status_code == 502
+        assert resp.json()["detail"] == "Model inference failed"
+        assert "Model inference failed" in caplog.text
+
+    def test_extract_batch_returns_502_on_model_error(self, client, mock_model):
+        mock_model.batch_predict_entities.side_effect = RuntimeError("boom")
+
+        resp = client.post(
+            "/extract_batch", json={"texts": ["a", "b"], "labels": ["person"]}
+        )
+
+        assert resp.status_code == 502
+        assert resp.json()["detail"] == "Model inference failed"
+
+
+# ---------------------------------------------------------------------------
+# INFO-level request/summary logging
+# ---------------------------------------------------------------------------
+
+class TestRequestAndSummaryLogging:
+    def test_extract_logs_request_summary(self, client, mock_model, caplog):
+        text = "Angela Merkel visited Berlin"
+
+        with caplog.at_level(logging.INFO):
+            resp = client.post(
+                "/extract",
+                json={"text": text, "labels": ["person", "city", "person"]},
+            )
+
+        assert resp.status_code == 200
+        assert f"extract: received text={len(text)} chars, labels=3 (2 after dedup)" in caplog.text
+
+    def test_extract_batch_logs_request_summary(self, client, mock_model, caplog):
+        with caplog.at_level(logging.INFO):
+            resp = client.post(
+                "/extract_batch",
+                json={"texts": ["a", "b"], "labels": ["person", "person"]},
+            )
+
+        assert resp.status_code == 200
+        assert "extract_batch: received 2 texts, labels=2 (1 after dedup)" in caplog.text
+
+    def test_logs_cleaning_summary_for_single_chunk_text(self, client, mock_model, caplog):
+        text = "Angela Merkel visited Berlin"
+
+        with caplog.at_level(logging.INFO):
+            resp = client.post("/extract", json={"text": text, "labels": ["person"]})
+
+        assert resp.status_code == 200
+        assert f"Text 0: {len(text)} chars -> {len(text)} chars after cleaning, 1 chunk(s)" in caplog.text
+
+    def test_logs_empty_after_cleaning(self, client, mock_model, caplog):
+        with caplog.at_level(logging.INFO):
+            resp = client.post("/extract", json={"text": "   ", "labels": ["person"]})
+
+        assert resp.status_code == 200
+        assert "Text 0: 3 chars -> empty after cleaning, skipped" in caplog.text
+
+    def test_logs_entities_found_summary_for_single_chunk(self, client, mock_model, caplog):
+        mock_model.batch_predict_entities.return_value = [
+            [
+                {"text": "Angela Merkel", "label": "person", "start": 0, "end": 13, "score": 0.98},
+                {"text": "Berlin", "label": "city", "start": 22, "end": 28, "score": 0.95},
+            ],
+        ]
+
+        with caplog.at_level(logging.INFO):
+            resp = client.post(
+                "/extract",
+                json={"text": "Angela Merkel visited Berlin", "labels": ["person", "city"]},
+            )
+
+        assert resp.status_code == 200
+        assert "Text 0: 2 entities found from 1 chunk(s): {'person': 1, 'city': 1}" in caplog.text

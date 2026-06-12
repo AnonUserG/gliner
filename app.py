@@ -1,11 +1,14 @@
+import html
 import os
 import re
 import time
 import logging
+import unicodedata
+from collections import Counter
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
@@ -30,6 +33,7 @@ DEFAULT_THRESHOLD = float(os.environ.get("DEFAULT_THRESHOLD", "0.5"))
 # container start so the image rarely needs rebuilding.
 MAX_TEXT_LENGTH = _env_int("MAX_TEXT_LENGTH")
 MAX_BATCH_SIZE = _env_int("MAX_BATCH_SIZE")
+MAX_LABELS = _env_int("MAX_LABELS")
 
 # GLiNER's underlying span model truncates each input to `config.max_len`
 # "words" (default 384), silently dropping anything beyond that — see
@@ -73,7 +77,7 @@ app = FastAPI(title="GLiNER NER Service", version="1.0.0", lifespan=lifespan)
 
 class ExtractRequest(BaseModel):
     text: str = Field(max_length=MAX_TEXT_LENGTH)
-    labels: list[str] = Field(..., min_length=1)
+    labels: list[str] = Field(..., min_length=1, max_length=MAX_LABELS)
     threshold: float = Field(default=DEFAULT_THRESHOLD, ge=0.0, le=1.0)
 
 
@@ -93,7 +97,7 @@ class ExtractBatchRequest(BaseModel):
     texts: list[Annotated[str, Field(max_length=MAX_TEXT_LENGTH)]] = Field(
         ..., max_length=MAX_BATCH_SIZE
     )
-    labels: list[str] = Field(..., min_length=1)
+    labels: list[str] = Field(..., min_length=1, max_length=MAX_LABELS)
     threshold: float = Field(default=DEFAULT_THRESHOLD, ge=0.0, le=1.0)
 
 
@@ -126,6 +130,55 @@ def _format_entities(raw: list[dict]) -> list[Entity]:
     ]
 
 
+# Characters that carry no semantic meaning but routinely show up in
+# copy-pasted or scraped text: C0/C1 control codes (keeping \t \n \r, which
+# the whitespace pass below collapses anyway), zero-width spaces/joiners,
+# the word joiner, BOM, and soft hyphen.
+_INVISIBLE_CHAR_PATTERN = re.compile(
+    "[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f-\\x9f"
+    "\\u00ad\\u200b-\\u200d\\u2060\\ufeff]"
+)
+_HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+_WHITESPACE_PATTERN = re.compile(r"\s+")
+
+
+def _clean_text(text: str) -> str:
+    """Strip markup/invisible characters and normalize whitespace.
+
+    Applied to every input text before chunking and inference, so the
+    `start`/`end` offsets in the response refer to positions in this
+    cleaned text, not the raw input.
+
+    Order matters: HTML entities are decoded first so any tags they spell
+    out (e.g. "&lt;b&gt;") get stripped too, then NFKC normalization folds
+    full-width/compatibility characters (including turning NBSP and other
+    Unicode spaces into a regular space) before remaining invisible
+    characters are removed and whitespace is collapsed.
+    """
+    text = html.unescape(text)
+    text = _HTML_TAG_PATTERN.sub(" ", text)
+    text = unicodedata.normalize("NFKC", text)
+    text = _INVISIBLE_CHAR_PATTERN.sub("", text)
+    text = _WHITESPACE_PATTERN.sub(" ", text)
+    return text.strip()
+
+
+def _clean_labels(labels: list[str]) -> list[str]:
+    """Strip whitespace, drop empty entries, and remove duplicate labels.
+
+    The order of first occurrence is preserved.
+    """
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for label in labels:
+        label = label.strip()
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        cleaned.append(label)
+    return cleaned
+
+
 def _chunk_text(text: str, chunk_size: int) -> list[tuple[int, int]]:
     """Split `text` into chunks of up to `chunk_size` words.
 
@@ -145,21 +198,22 @@ def _chunk_text(text: str, chunk_size: int) -> list[tuple[int, int]]:
 
 
 def _predict_entities(texts: list[str], labels: list[str], threshold: float) -> list[list[dict]]:
-    try:
+    if hasattr(model, "batch_predict_entities"):
         return model.batch_predict_entities(texts, labels, threshold=threshold)
-    except AttributeError:
-        # fallback for older gliner versions without batch API
-        return [model.predict_entities(text, labels, threshold=threshold) for text in texts]
+    # fallback for older gliner versions without batch API
+    return [model.predict_entities(text, labels, threshold=threshold) for text in texts]
 
 
 def _extract_entities(texts: list[str], labels: list[str], threshold: float) -> list[list[dict]]:
     """Extract entities for each text, transparently chunking long texts.
 
-    Texts longer than CHUNK_SIZE_WORDS words are split into chunks, each
-    chunk is run through the model independently, and the resulting
-    entities are merged back with their `start`/`end` offsets translated to
-    positions in the original text. All chunks across all input texts are
-    sent to the model in a single batched call.
+    Each text is first run through `_clean_text`, so `start`/`end` offsets
+    below — and in the response — refer to positions in the cleaned text,
+    not the raw input. Texts longer than CHUNK_SIZE_WORDS words are then
+    split into chunks, each chunk is run through the model independently,
+    and the resulting entities are merged back with their `start`/`end`
+    offsets translated to positions in the cleaned text. All chunks across
+    all input texts are sent to the model in a single batched call.
     """
     chunk_texts: list[str] = []
     # one entry per chunk, in the same order as chunk_texts
@@ -167,10 +221,18 @@ def _extract_entities(texts: list[str], labels: list[str], threshold: float) -> 
     chunk_counts: list[int] = [0] * len(texts)
 
     for text_idx, text in enumerate(texts):
+        raw_len = len(text)
+        text = _clean_text(text)
         if not text:
+            logger.info("Text %d: %d chars -> empty after cleaning, skipped", text_idx, raw_len)
             continue
+
         spans = _chunk_text(text, CHUNK_SIZE_WORDS)
         chunk_counts[text_idx] = len(spans)
+        logger.info(
+            "Text %d: %d chars -> %d chars after cleaning, %d chunk(s)",
+            text_idx, raw_len, len(text), len(spans),
+        )
         if len(spans) > 1:
             word_count = len(_WORD_PATTERN.findall(text))
             logger.info(
@@ -185,7 +247,14 @@ def _extract_entities(texts: list[str], labels: list[str], threshold: float) -> 
     if not chunk_texts:
         return results
 
-    raw_chunks = _predict_entities(chunk_texts, labels, threshold)
+    try:
+        raw_chunks = _predict_entities(chunk_texts, labels, threshold)
+    except Exception:
+        logger.exception(
+            "Model inference failed for %d chunk(s), %d label(s), threshold=%.2f",
+            len(chunk_texts), len(labels), threshold,
+        )
+        raise HTTPException(502, detail="Model inference failed")
 
     chunk_seen = [0] * len(texts)
     for (text_idx, offset), chunk_text, chunk_entities in zip(chunk_owner, chunk_texts, raw_chunks):
@@ -202,12 +271,14 @@ def _extract_entities(texts: list[str], labels: list[str], threshold: float) -> 
                 offset, len(chunk_text), len(chunk_entities),
             )
 
-    for text_idx, count in enumerate(chunk_counts):
-        if count > 1:
-            logger.info(
-                "Text %d: merged %d entities from %d chunks",
-                text_idx, len(results[text_idx]), count,
-            )
+    for text_idx, entities in enumerate(results):
+        if chunk_counts[text_idx] == 0:
+            continue
+        label_counts = dict(Counter(e["label"] for e in entities))
+        logger.info(
+            "Text %d: %d entities found from %d chunk(s): %s",
+            text_idx, len(entities), chunk_counts[text_idx], label_counts,
+        )
 
     return results
 
@@ -223,11 +294,19 @@ def health():
 
 @app.post("/extract", response_model=ExtractResponse)
 def extract(req: ExtractRequest):
+    labels = _clean_labels(req.labels)
+    logger.info(
+        "extract: received text=%d chars, labels=%d (%d after dedup)",
+        len(req.text), len(req.labels), len(labels),
+    )
+    if not labels:
+        raise HTTPException(422, detail="labels must contain at least one non-empty value")
+
     if not req.text:
         return ExtractResponse(entities=[])
 
     t0 = time.time()
-    raw = _extract_entities([req.text], req.labels, req.threshold)[0]
+    raw = _extract_entities([req.text], labels, req.threshold)[0]
     logger.debug("Inference /extract: %.3f s, %d entities", time.time() - t0, len(raw))
 
     return ExtractResponse(entities=_format_entities(raw))
@@ -235,11 +314,19 @@ def extract(req: ExtractRequest):
 
 @app.post("/extract_batch", response_model=ExtractBatchResponse)
 def extract_batch(req: ExtractBatchRequest):
+    labels = _clean_labels(req.labels)
+    logger.info(
+        "extract_batch: received %d texts, labels=%d (%d after dedup)",
+        len(req.texts), len(req.labels), len(labels),
+    )
+    if not labels:
+        raise HTTPException(422, detail="labels must contain at least one non-empty value")
+
     if not req.texts:
         return ExtractBatchResponse(results=[])
 
     t0 = time.time()
-    raw_batch = _extract_entities(req.texts, req.labels, req.threshold)
+    raw_batch = _extract_entities(req.texts, labels, req.threshold)
     logger.debug(
         "Inference /extract_batch: %.3f s, %d texts",
         time.time() - t0,
