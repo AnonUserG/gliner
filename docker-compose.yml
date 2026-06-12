@@ -5,10 +5,27 @@ services:
     container_name: ner-gliner
     ports:
       - "8000:8000"
-    env_file:
-      - .env
     environment:
+      # Модель GLiNER (должна быть запечена в образ для офлайн-режима)
+      MODEL_NAME: urchade/gliner_multi-v2.1
+      # Число воркеров uvicorn — каждый держит отдельную копию модели (~1.5 GB RAM)
+      WORKERS: 1
+      # Уровень логирования: DEBUG, INFO, WARNING, ERROR...
+      LOG_LEVEL: INFO
+      # threshold по умолчанию, если он не передан в запросе
+      DEFAULT_THRESHOLD: "0.5"
+      # Размер чанка (в словах) для разбиения длинных текстов
+      CHUNK_SIZE_WORDS: 300
+      # Максимальная длина text / элемента texts в символах. Пусто = без ограничений
+      MAX_TEXT_LENGTH: ""
+      # Максимальное число элементов texts в /extract_batch. Пусто = без ограничений
+      MAX_BATCH_SIZE: 10
+      # Максимальное число элементов labels (до дедупликации). Пусто = без ограничений
+      MAX_LABELS: 10
+      # Адрес Zipkin-коллектора. Внутри docker-сети — по имени сервиса, не по внешнему порту
       ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
+      # Имя сервиса в Zipkin/Grafana
+      OTEL_SERVICE_NAME: ner-gliner
     depends_on:
       - zipkin
 

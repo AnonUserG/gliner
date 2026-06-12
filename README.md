@@ -503,7 +503,7 @@ docker compose up -d
 - **Prometheus** — http://localhost:9090
 - **Grafana** — http://localhost:3000 (логин `admin` / пароль `admin`, см. `GF_SECURITY_ADMIN_PASSWORD`), дашборд "GLiNER NER Service" и datasource Prometheus подключены автоматически через [`grafana/provisioning`](grafana/provisioning)
 
-Сервис запускается с переменными из [`.env`](.env) (`env_file`), а `ZIPKIN_ENDPOINT` переопределяется на `http://zipkin:9411/api/v2/spans`, чтобы трейсы сразу шли в поднятый Zipkin. Prometheus сконфигурирован через [`prometheus/prometheus.yml`](prometheus/prometheus.yml) и скрейпит `ner-gliner:8000/metrics`. Все три сервиса мониторинга общаются друг с другом по внутренней docker-сети (по именам сервисов), внешние порты используются только для доступа с хоста.
+Все переменные окружения сервиса (см. таблицу выше) заданы прямо в [`docker-compose.yml`](docker-compose.yml) со значениями по умолчанию; `ZIPKIN_ENDPOINT` указывает на `http://zipkin:9411/api/v2/spans`, чтобы трейсы сразу шли в поднятый Zipkin. Prometheus сконфигурирован через [`prometheus/prometheus.yml`](prometheus/prometheus.yml) и скрейпит `ner-gliner:8000/metrics`. Все три сервиса мониторинга общаются друг с другом по внутренней docker-сети (по именам сервисов), внешние порты используются только для доступа с хоста.
 
 Остановить и удалить стек:
 
