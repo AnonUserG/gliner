@@ -43,6 +43,11 @@ if "person" not in labels:
 print("Smoke-test passed.", flush=True)
 PYEOF
 
+# Install monitoring dependencies in their own layer so changes here don't
+# invalidate the cached model download above.
+COPY requirements-monitoring.txt .
+RUN pip install --no-cache-dir -r requirements-monitoring.txt
+
 # Copy application and tests (tests allow running pytest inside the container)
 COPY app.py .
 COPY tests/ tests/

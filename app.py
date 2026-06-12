@@ -4,19 +4,44 @@ import re
 import time
 import logging
 import unicodedata
+import uuid
 from collections import Counter
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Annotated, Any, Optional
 
-from fastapi import FastAPI, HTTPException
+import requests
+from fastapi import FastAPI, HTTPException, Request
+from opentelemetry import trace
+from opentelemetry.exporter.zipkin.json import ZipkinExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExportResult
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 
+# Per-request correlation ID, set by the middleware below and injected into
+# every log line so concurrent requests can be told apart. "-" for log
+# records emitted outside a request (e.g. at startup).
+_trace_id_var: ContextVar[str] = ContextVar("trace_id", default="-")
+
+
+class _TraceIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.trace_id = _trace_id_var.get()
+        return True
+
+
 logging.basicConfig(
     level=LOG_LEVEL,
-    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s [%(trace_id)s] - %(message)s",
 )
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_TraceIdFilter())
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,6 +53,11 @@ def _env_int(name: str) -> Optional[int]:
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "urchade/gliner_multi-v2.1")
 DEFAULT_THRESHOLD = float(os.environ.get("DEFAULT_THRESHOLD", "0.5"))
+
+# Zipkin collector endpoint for trace export, e.g. http://zipkin:9411/api/v2/spans.
+# Unset/empty disables tracing entirely.
+ZIPKIN_ENDPOINT = os.environ.get("ZIPKIN_ENDPOINT")
+OTEL_SERVICE_NAME = os.environ.get("OTEL_SERVICE_NAME", "ner-gliner")
 
 # Optional limits — unset/empty env var means unlimited. Configurable at
 # container start so the image rarely needs rebuilding.
@@ -69,6 +99,89 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="GLiNER NER Service", version="1.0.0", lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Monitoring: Prometheus metrics + Zipkin tracing
+# ---------------------------------------------------------------------------
+
+# Exposes GET /metrics in Prometheus text format (request counts, latency
+# histograms, request/response sizes, etc.).
+Instrumentator().instrument(app).expose(app)
+
+
+@app.middleware("http")
+async def _add_trace_id(request: Request, call_next):
+    """Assign a trace ID to the request and make it available to logging.
+
+    Reuses the active OpenTelemetry span's trace ID when Zipkin tracing is
+    enabled (so logs can be correlated with Zipkin traces), otherwise
+    generates a random one. Registered before FastAPIInstrumentor.instrument_app()
+    below so that, when tracing is enabled, the OTel span is already current
+    by the time this middleware runs.
+    """
+    span_context = trace.get_current_span().get_span_context()
+    trace_id = (
+        format(span_context.trace_id, "032x")
+        if span_context.is_valid
+        else uuid.uuid4().hex
+    )
+    token = _trace_id_var.set(trace_id)
+    try:
+        return await call_next(request)
+    finally:
+        _trace_id_var.reset(token)
+
+
+class _QuietZipkinExporter(ZipkinExporter):
+    """ZipkinExporter that reports connectivity loss/recovery only once.
+
+    By default, a failed export raises and BatchSpanProcessor logs a full
+    ERROR traceback for every batch — every few seconds while Zipkin is
+    down. This wraps export() so the failure is logged once, stays quiet
+    on repeated failures, and logs once more when exports start succeeding
+    again.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._unreachable = False
+
+    def export(self, spans):
+        try:
+            result = super().export(spans)
+        except requests.exceptions.RequestException as exc:
+            if not self._unreachable:
+                logger.warning(
+                    "Zipkin (%s) unreachable, dropping traces until it recovers: %s",
+                    self.endpoint, exc,
+                )
+                self._unreachable = True
+            return SpanExportResult.FAILURE
+
+        if result == SpanExportResult.SUCCESS:
+            if self._unreachable:
+                logger.info("Zipkin (%s) reachable again, resuming trace export", self.endpoint)
+                self._unreachable = False
+        elif not self._unreachable:
+            logger.warning("Zipkin (%s) unreachable, dropping traces until it recovers", self.endpoint)
+            self._unreachable = True
+
+        return result
+
+
+if ZIPKIN_ENDPOINT:
+    _tracer_provider = TracerProvider(
+        resource=Resource.create({"service.name": OTEL_SERVICE_NAME})
+    )
+    _tracer_provider.add_span_processor(
+        BatchSpanProcessor(_QuietZipkinExporter(endpoint=ZIPKIN_ENDPOINT))
+    )
+    trace.set_tracer_provider(_tracer_provider)
+    FastAPIInstrumentor.instrument_app(app)
+    logger.info("Zipkin tracing enabled, sending spans to %s", ZIPKIN_ENDPOINT)
+else:
+    logger.info("Zipkin tracing disabled (ZIPKIN_ENDPOINT not set)")
 
 
 # ---------------------------------------------------------------------------

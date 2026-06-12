@@ -1,0 +1,42 @@
+services:
+  ner-gliner:
+    build: .
+    image: ner-gliner:1.0
+    container_name: ner-gliner
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
+    depends_on:
+      - zipkin
+
+  zipkin:
+    image: openzipkin/zipkin:3.5.1
+    container_name: zipkin
+    ports:
+      - "9411:9411"
+
+  prometheus:
+    image: prom/prometheus:v3.9.1
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - ner-gliner
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/ner-gliner-dashboard.json:/var/lib/grafana/dashboards/ner-gliner-dashboard.json:ro
+    depends_on:
+      - prometheus

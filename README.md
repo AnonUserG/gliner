@@ -21,10 +21,18 @@ REST-сервис на FastAPI с моделью [urchade/gliner_multi-v2.1](htt
 
 ```
 ner-gliner/
-├── app.py                # FastAPI-сервис
-├── requirements.txt      # зависимости (без torch — устанавливается отдельно)
-├── requirements-dev.txt  # pytest, httpx
+├── app.py                      # FastAPI-сервис
+├── requirements.txt            # зависимости (без torch — устанавливается отдельно)
+├── requirements-monitoring.txt # Prometheus/Zipkin зависимости
+├── requirements-dev.txt        # pytest, httpx
 ├── Dockerfile
+├── docker-compose.yml          # сервис + Zipkin + Prometheus + Grafana
+├── prometheus/prometheus.yml   # конфиг скрейпа Prometheus
+├── grafana/
+│   ├── ner-gliner-dashboard.json      # готовый дашборд Grafana
+│   └── provisioning/                  # автоподключение datasource и дашборда в docker-compose
+│       ├── datasources/datasource.yml
+│       └── dashboards/dashboard.yml
 ├── .dockerignore
 ├── README.md
 └── tests/
@@ -93,6 +101,8 @@ docker run -d -p 8000:8000 --name ner-gliner --env-file .env ner-gliner:1.0
 | `DEFAULT_THRESHOLD` | `0.5` | Значение `threshold`, если оно не передано в запросе. |
 | `LOG_LEVEL` | `INFO` | Уровень логирования (`DEBUG`, `INFO`, `WARNING`, ...). |
 | `CHUNK_SIZE_WORDS` | `300` | Размер чанка (в словах) для разбиения длинных текстов — см. раздел "Чанкование длинных текстов". |
+| `ZIPKIN_ENDPOINT` | не задано (трейсинг отключён) | URL Zipkin-коллектора для отправки трейсов, например `http://zipkin:9411/api/v2/spans`. См. раздел "Мониторинг". |
+| `OTEL_SERVICE_NAME` | `ner-gliner` | Имя сервиса в трейсах (атрибут `service.name`). |
 
 ```bash
 docker run -d -p 8000:8000 \
@@ -195,6 +205,16 @@ curl -X POST http://localhost:8000/extract \
 curl -X POST http://localhost:8000/extract_batch \
   -H "Content-Type: application/json" \
   -d '{"texts":["Angela Merkel visited Berlin.","Barack Obama is from Chicago."],"labels":["person","city"]}'
+```
+
+---
+
+### GET /metrics
+
+Метрики в формате Prometheus (количество запросов, латентность, размеры запросов/ответов) — см. раздел "Мониторинг".
+
+```bash
+curl http://localhost:8000/metrics
 ```
 
 ---
@@ -383,6 +403,14 @@ curl -X POST http://localhost:8000/extract_batch \
 
 Сервис пишет логи в консоль (stdout) — удобно смотреть через `docker logs`. Уровень задаётся переменной `LOG_LEVEL` (по умолчанию `INFO`).
 
+Каждая строка лога содержит trace ID запроса в квадратных скобках:
+
+```
+2026-06-12 14:46:29,197 INFO app [4bf92f3577b34da6a3ce929d0e0e4736] - extract: received text=39 chars, labels=3 (3 after dedup)
+```
+
+Trace ID вычисляется один раз при получении запроса и одинаков для всех строк лога, относящихся к этому запросу — по нему можно отличить логи параллельных запросов друг от друга. Если включён Zipkin-трейсинг (`ZIPKIN_ENDPOINT` задан), значение совпадает с trace ID соответствующего спана в Zipkin, что позволяет напрямую перейти от строки лога к трейсу. Логи, не связанные с запросом (например, при старте сервиса), помечаются `-`.
+
 На уровне `INFO` для каждого запроса к `/extract` и `/extract_batch` пишется:
 
 - **Сводка запроса**: длина текста (или количество текстов для батча) и число меток до/после дедупликации, например:
@@ -408,6 +436,72 @@ curl -X POST http://localhost:8000/extract_batch \
   ```
 
 Ошибки инференса модели логируются с уровнем `ERROR` (с traceback) — см. строку "Ошибки модели" в разделе "Контракт".
+
+---
+
+## Мониторинг
+
+### Метрики Prometheus
+
+Сервис экспортирует метрики в формате Prometheus на `GET /metrics` (через `prometheus-fastapi-instrumentator`):
+
+- `http_requests_total{handler, method, status}` — счётчик запросов.
+- `http_request_duration_seconds{handler, method}` — гистограмма латентности (для percentile-расчётов по эндпоинту).
+- `http_request_duration_highr_seconds` — та же латентность с более точными бакетами, без меток по эндпоинту.
+- `http_request_size_bytes{handler}` / `http_response_size_bytes{handler}` — размеры тел запросов/ответов.
+
+Пример конфигурации скрейпа Prometheus:
+
+```yaml
+scrape_configs:
+  - job_name: ner-gliner
+    static_configs:
+      - targets: ["ner-gliner:8000"]
+```
+
+### Трейсинг (Zipkin)
+
+При запуске с непустой переменной `ZIPKIN_ENDPOINT` (например, `http://zipkin:9411/api/v2/spans`) сервис через OpenTelemetry инструментирует все эндпоинты FastAPI и отправляет спаны в указанный Zipkin-коллектор. Имя сервиса в трейсах задаётся переменной `OTEL_SERVICE_NAME` (по умолчанию `ner-gliner`). Если `ZIPKIN_ENDPOINT` не задан, трейсинг полностью отключён (нет накладных расходов, в лог пишется `Zipkin tracing disabled`).
+
+```bash
+docker run -d -p 8000:8000 --name ner-gliner \
+  -e ZIPKIN_ENDPOINT=http://zipkin:9411/api/v2/spans \
+  -e OTEL_SERVICE_NAME=ner-gliner \
+  ner-gliner:1.0
+```
+
+Недоступность Zipkin не влияет на обработку запросов: спаны экспортируются в фоне (`BatchSpanProcessor`), а при потере связи с коллектором сервис один раз пишет `WARNING ... Zipkin (...) unreachable, dropping traces until it recovers` и молчит, пока Zipkin не восстановится (затем один раз пишет `INFO ... reachable again`) — без захламления логов повторяющимися ошибками.
+
+### Дашборд Grafana
+
+Готовый дашборд лежит в [`grafana/ner-gliner-dashboard.json`](grafana/ner-gliner-dashboard.json) и строится на метриках `/metrics` выше: request rate по эндпоинтам, error rate (5xx), латентность p50/p95/p99, общее число запросов, средние размеры запросов/ответов.
+
+При запуске через `docker compose` (см. ниже) дашборд и Prometheus datasource подключаются автоматически — ничего импортировать не нужно.
+
+Для импорта в отдельный Grafana: **Dashboards → New → Import**, загрузить файл `grafana/ner-gliner-dashboard.json` и выбрать свой Prometheus datasource в переменной `Prometheus` сверху дашборда.
+
+### Запуск стека через docker-compose
+
+В корне проекта есть [`docker-compose.yml`](docker-compose.yml), который поднимает сервис вместе с Zipkin, Prometheus и Grafana:
+
+```bash
+docker compose up -d
+```
+
+После старта доступны:
+
+- **ner-gliner** — http://localhost:8000 (`/extract`, `/health`, `/metrics`)
+- **Zipkin UI** — http://localhost:9411
+- **Prometheus** — http://localhost:9090
+- **Grafana** — http://localhost:3000 (логин `admin` / пароль `admin`, см. `GF_SECURITY_ADMIN_PASSWORD`), дашборд "GLiNER NER Service" и datasource Prometheus подключены автоматически через [`grafana/provisioning`](grafana/provisioning)
+
+Сервис запускается с переменными из [`.env`](.env) (`env_file`), а `ZIPKIN_ENDPOINT` переопределяется на `http://zipkin:9411/api/v2/spans`, чтобы трейсы сразу шли в поднятый Zipkin. Prometheus сконфигурирован через [`prometheus/prometheus.yml`](prometheus/prometheus.yml) и скрейпит `ner-gliner:8000/metrics`. Все три сервиса мониторинга общаются друг с другом по внутренней docker-сети (по именам сервисов), внешние порты используются только для доступа с хоста.
+
+Остановить и удалить стек:
+
+```bash
+docker compose down
+```
 
 ---
 

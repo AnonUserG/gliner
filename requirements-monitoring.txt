@@ -1,0 +1,12 @@
+# Monitoring: Prometheus metrics (/metrics) and Zipkin tracing.
+# Installed in a separate layer (after the model bake step) so changes here
+# don't invalidate the cached model download.
+prometheus-fastapi-instrumentator==7.0.0
+opentelemetry-api==1.24.0
+opentelemetry-sdk==1.24.0
+opentelemetry-instrumentation-fastapi==0.45b0
+opentelemetry-exporter-zipkin-json==1.24.0
+
+# opentelemetry-instrumentation 0.45b0 still imports pkg_resources, which
+# newer setuptools releases drop.
+setuptools<81

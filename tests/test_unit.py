@@ -3,8 +3,11 @@ Unit tests — no real model loaded.
 Run with:  pytest -m "not integration"
 """
 import logging
+from unittest.mock import MagicMock
 
-from app import _chunk_text, _clean_labels, _clean_text
+import requests
+
+from app import _chunk_text, _clean_labels, _clean_text, _QuietZipkinExporter
 
 
 # ---------------------------------------------------------------------------
@@ -18,6 +21,90 @@ def test_health_shape(client):
     assert data["status"] == "ok"
     assert isinstance(data["model"], str) and data["model"]
     assert data["model_loaded"] is True
+
+
+# ---------------------------------------------------------------------------
+# /metrics
+# ---------------------------------------------------------------------------
+
+def test_metrics_endpoint_exposes_prometheus_format(client):
+    client.get("/health")  # generate at least one request to instrument
+
+    resp = client.get("/metrics")
+
+    assert resp.status_code == 200
+    assert "text/plain" in resp.headers["content-type"]
+    assert "http_requests_total" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Trace ID logging
+# ---------------------------------------------------------------------------
+
+def test_logs_include_trace_id(client, caplog):
+    with caplog.at_level(logging.INFO):
+        client.post(
+            "/extract",
+            json={"text": "Angela Merkel visited Berlin.", "labels": ["person", "city"]},
+        )
+
+    records = [r for r in caplog.records if "extract: received" in r.getMessage()]
+    assert records
+    trace_id = records[0].trace_id
+    assert trace_id != "-"
+    assert int(trace_id, 16)  # 32-char hex string
+    assert len(trace_id) == 32
+
+
+def test_trace_id_differs_across_requests(client, caplog):
+    with caplog.at_level(logging.INFO):
+        client.post("/extract", json={"text": "a", "labels": ["person"]})
+        client.post("/extract", json={"text": "b", "labels": ["person"]})
+
+    records = [r for r in caplog.records if "extract: received" in r.getMessage()]
+    assert len(records) == 2
+    assert records[0].trace_id != records[1].trace_id
+
+
+def test_log_without_request_has_placeholder_trace_id(caplog):
+    with caplog.at_level(logging.INFO, logger="app"):
+        logging.getLogger("app").info("outside any request")
+
+    records = [r for r in caplog.records if r.getMessage() == "outside any request"]
+    assert records[0].trace_id == "-"
+
+
+# ---------------------------------------------------------------------------
+# _QuietZipkinExporter
+# ---------------------------------------------------------------------------
+
+class TestQuietZipkinExporter:
+    def test_logs_unreachable_once(self, caplog):
+        exporter = _QuietZipkinExporter(endpoint="http://zipkin.invalid:9411/api/v2/spans")
+        exporter.session.post = MagicMock(
+            side_effect=requests.exceptions.ConnectionError("boom")
+        )
+
+        with caplog.at_level(logging.WARNING):
+            exporter.export([])
+            exporter.export([])
+
+        warnings = [r for r in caplog.records if "unreachable" in r.getMessage()]
+        assert len(warnings) == 1
+
+    def test_logs_recovery_once(self, caplog):
+        exporter = _QuietZipkinExporter(endpoint="http://zipkin:9411/api/v2/spans")
+        exporter._unreachable = True
+        exporter.session.post = MagicMock(return_value=MagicMock(status_code=202))
+
+        with caplog.at_level(logging.INFO):
+            result = exporter.export([])
+
+        from opentelemetry.sdk.trace.export import SpanExportResult
+        assert result == SpanExportResult.SUCCESS
+        assert exporter._unreachable is False
+        recovered = [r for r in caplog.records if "reachable again" in r.getMessage()]
+        assert len(recovered) == 1
 
 
 # ---------------------------------------------------------------------------
