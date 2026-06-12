@@ -29,8 +29,9 @@ ner-gliner/
 ├── docker-compose.yml          # сервис + Zipkin + Prometheus + Grafana
 ├── prometheus/prometheus.yml   # конфиг скрейпа Prometheus
 ├── grafana/
-│   ├── ner-gliner-dashboard.json      # готовый дашборд Grafana
-│   └── provisioning/                  # автоподключение datasource и дашборда в docker-compose
+│   ├── ner-gliner-dashboard.json          # дашборд: HTTP-метрики сервиса
+│   ├── ner-gliner-process-dashboard.json  # дашборд: процесс/runtime (CPU, память, GC)
+│   └── provisioning/                      # автоподключение datasource и дашбордов в docker-compose
 │       ├── datasources/datasource.yml
 │       └── dashboards/dashboard.yml
 ├── .dockerignore
@@ -474,13 +475,18 @@ docker run -d -p 8000:8000 --name ner-gliner \
 
 Недоступность Zipkin не влияет на обработку запросов: спаны экспортируются в фоне (`BatchSpanProcessor`), а при потере связи с коллектором сервис один раз пишет `WARNING ... Zipkin (...) unreachable, dropping traces until it recovers` и молчит, пока Zipkin не восстановится (затем один раз пишет `INFO ... reachable again`) — без захламления логов повторяющимися ошибками.
 
-### Дашборд Grafana
+### Дашборды Grafana
 
-Готовый дашборд лежит в [`grafana/ner-gliner-dashboard.json`](grafana/ner-gliner-dashboard.json) и строится на метриках `/metrics` выше: request rate по эндпоинтам, error rate (5xx), латентность p50/p95/p99, общее число запросов, средние размеры запросов/ответов.
+В комплекте два готовых дашборда:
 
-При запуске через `docker compose` (см. ниже) дашборд и Prometheus datasource подключаются автоматически — ничего импортировать не нужно.
+- [`grafana/ner-gliner-dashboard.json`](grafana/ner-gliner-dashboard.json) — HTTP-метрики: request rate по эндпоинтам, error rate (5xx), латентность p50/p95/p99, общее число запросов, средние размеры запросов/ответов.
+- [`grafana/ner-gliner-process-dashboard.json`](grafana/ner-gliner-process-dashboard.json) — процесс/runtime (аналог "JVM (Micrometer)" для Java, но для Python-процесса): CPU, memory (RSS/virtual), open file descriptors, uptime, частота сборок мусора (GC) по поколениям.
 
-Для импорта в отдельный Grafana: **Dashboards → New → Import**, загрузить файл `grafana/ner-gliner-dashboard.json` и выбрать свой Prometheus datasource в переменной `Prometheus` сверху дашборда.
+Оба собраны на стандартных метриках `prometheus_client`/`prometheus-fastapi-instrumentator`, которые сервис уже экспортирует на `/metrics` — отдельно настраивать экспорт не нужно.
+
+При запуске через `docker compose` (см. ниже) оба дашборда и Prometheus datasource подключаются автоматически — ничего импортировать не нужно.
+
+Для импорта в отдельный Grafana: **Dashboards → New → Import**, загрузить нужный JSON-файл и выбрать свой Prometheus datasource в переменной `Prometheus` сверху дашборда.
 
 ### Запуск стека через docker-compose
 

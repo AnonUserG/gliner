@@ -38,5 +38,6 @@ services:
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/ner-gliner-dashboard.json:/var/lib/grafana/dashboards/ner-gliner-dashboard.json:ro
+      - ./grafana/ner-gliner-process-dashboard.json:/var/lib/grafana/dashboards/ner-gliner-process-dashboard.json:ro
     depends_on:
       - prometheus
