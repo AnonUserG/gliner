@@ -1,5 +1,11 @@
 # torch is installed separately from the CPU wheel index — see Dockerfile:
 #   pip install torch==2.1.2 --index-url https://download.pytorch.org/whl/cpu
+
+# torch==2.1.2 is compiled against the NumPy 1.x ABI; without this pin,
+# gliner/transformers pull in NumPy 2.x and torch logs an "_ARRAY_API not
+# found" warning (and risks incorrect results) on every startup.
+numpy==1.26.4
+
 fastapi==0.109.2
 uvicorn[standard]==0.27.1
 pydantic==2.6.1
