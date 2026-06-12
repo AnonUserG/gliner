@@ -45,6 +45,24 @@ for _handler in logging.getLogger().handlers:
 logger = logging.getLogger(__name__)
 
 
+class _AccessLogFilter(logging.Filter):
+    """Drops uvicorn access-log lines for endpoints polled on a timer
+    (Prometheus scraping /metrics, Docker healthchecks hitting /health),
+    which would otherwise dominate the logs.
+    """
+
+    _IGNORED_PATHS = ("/metrics", "/health")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if len(record.args) >= 3:
+            path = record.args[2].split("?", 1)[0]
+            return path not in self._IGNORED_PATHS
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_AccessLogFilter())
+
+
 def _env_int(name: str) -> Optional[int]:
     """Read an optional positive-int env var; unset/empty means unlimited."""
     value = os.environ.get(name)

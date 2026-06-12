@@ -75,6 +75,33 @@ def test_log_without_request_has_placeholder_trace_id(caplog):
 
 
 # ---------------------------------------------------------------------------
+# _AccessLogFilter
+# ---------------------------------------------------------------------------
+
+class TestAccessLogFilter:
+    def _record(self, path):
+        return logging.LogRecord(
+            name="uvicorn.access", level=logging.INFO, pathname="", lineno=0,
+            msg='%s - "%s %s HTTP/%s" %d',
+            args=("127.0.0.1:0", "GET", path, "1.1", 200),
+            exc_info=None,
+        )
+
+    def test_drops_metrics_and_health(self):
+        from app import _AccessLogFilter
+        f = _AccessLogFilter()
+        assert f.filter(self._record("/metrics")) is False
+        assert f.filter(self._record("/health")) is False
+        assert f.filter(self._record("/health?foo=bar")) is False
+
+    def test_keeps_other_paths(self):
+        from app import _AccessLogFilter
+        f = _AccessLogFilter()
+        assert f.filter(self._record("/extract")) is True
+        assert f.filter(self._record("/extract_batch")) is True
+
+
+# ---------------------------------------------------------------------------
 # _QuietZipkinExporter
 # ---------------------------------------------------------------------------
 
