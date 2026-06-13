@@ -7,3 +7,28 @@ datasources:
     access: proxy
     url: http://prometheus:9090
     isDefault: true
+
+  - name: Zipkin
+    uid: zipkin
+    type: zipkin
+    access: proxy
+    url: http://zipkin:9411
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      # Каждая строка лога приложения содержит trace ID в квадратных
+      # скобках, например:
+      # "... app [4bf92f3577b34da6a3ce929d0e0e4736] - extract: ...".
+      # Это превращает его в кликабельную ссылку "View Trace", которая
+      # открывает соответствующий трейс в Zipkin прямо из строки лога
+      # в Grafana Explore.
+      derivedFields:
+        - datasourceUid: zipkin
+          matcherRegex: "\\[([0-9a-f]{32})\\]"
+          name: TraceID
+          url: "$${__value.raw}"
+          urlDisplayLabel: "View Trace"

@@ -26,13 +26,15 @@ ner-gliner/
 ├── requirements-monitoring.txt # Prometheus/Zipkin зависимости
 ├── requirements-dev.txt        # pytest, httpx
 ├── Dockerfile
-├── docker-compose.yml          # сервис + Zipkin + Prometheus + Grafana
+├── docker-compose.yml          # сервис + Zipkin + Prometheus + Grafana + Loki + Alloy
 ├── prometheus/prometheus.yml   # конфиг скрейпа Prometheus
+├── loki/loki-config.yaml       # конфиг Loki (хранилище логов, filesystem)
+├── alloy/config.alloy          # конфиг Alloy — сбор логов всех контейнеров и отправка в Loki
 ├── grafana/
 │   ├── ner-gliner-dashboard.json          # дашборд: HTTP-метрики сервиса
 │   ├── ner-gliner-process-dashboard.json  # дашборд: процесс/runtime (CPU, память, GC)
 │   └── provisioning/                      # автоподключение datasource и дашбордов в docker-compose
-│       ├── datasources/datasource.yml
+│       ├── datasources/datasource.yml     # Prometheus, Zipkin, Loki (+ переход из логов в трейсы)
 │       └── dashboards/dashboard.yml
 ├── .dockerignore
 ├── README.md
@@ -475,6 +477,26 @@ docker run -d -p 8000:8000 --name ner-gliner \
 
 Недоступность Zipkin не влияет на обработку запросов: спаны экспортируются в фоне (`BatchSpanProcessor`), а при потере связи с коллектором сервис один раз пишет `WARNING ... Zipkin (...) unreachable, dropping traces until it recovers` и молчит, пока Zipkin не восстановится (затем один раз пишет `INFO ... reachable again`) — без захламления логов повторяющимися ошибками.
 
+### Логи (Loki + Alloy) и переход из логов в трейсы
+
+Логи всех контейнеров стека собираются и хранятся централизованно:
+
+- **[`grafana/alloy:v1.12.2`](https://grafana.com/docs/alloy/)** ([`alloy/config.alloy`](alloy/config.alloy)) — через Docker socket обнаруживает все запущенные контейнеры (`discovery.docker`), читает их stdout/stderr и отправляет в Loki (`loki.source.docker` → `loki.write`). Каждой записи присваивается label `container` с именем контейнера. UI/API Alloy — http://localhost:12345.
+- **[`grafana/loki:3.6.3`](https://grafana.com/docs/loki/)** ([`loki/loki-config.yaml`](loki/loki-config.yaml)) — хранит логи на диске (filesystem-хранилище, TSDB-индекс) в volume `loki-data`. API — http://localhost:3100.
+
+В Grafana ([`grafana/provisioning/datasources/datasource.yml`](grafana/provisioning/datasources/datasource.yml)) автоматически подключены datasource **Loki** и **Zipkin**. Для Loki настроено **derived field**: каждая строка лога `app` содержит trace ID в квадратных скобках (см. раздел "Логирование"), и регулярка `\[([0-9a-f]{32})\]` превращает его в кликабельную ссылку **"View Trace"**, которая открывает соответствующий трейс в Zipkin прямо из Grafana Explore — без копирования ID вручную.
+
+Проверить вручную:
+
+```bash
+# Логи ner-gliner за последние 5 минут
+curl -s -G http://localhost:3100/loki/api/v1/query_range \
+  --data-urlencode 'query={container="ner-gliner"}'
+
+# Открыть в Grafana: Explore → datasource "Loki" → запрос {container="ner-gliner"}
+# Возле строк с trace ID появится ссылка "View Trace" → трейс в Zipkin
+```
+
 ### Дашборды Grafana
 
 В комплекте два готовых дашборда:
@@ -490,7 +512,7 @@ docker run -d -p 8000:8000 --name ner-gliner \
 
 ### Запуск стека через docker-compose
 
-В корне проекта есть [`docker-compose.yml`](docker-compose.yml), который поднимает сервис вместе с Zipkin, Prometheus и Grafana:
+В корне проекта есть [`docker-compose.yml`](docker-compose.yml), который поднимает сервис вместе с Zipkin, Prometheus, Grafana, Loki и Alloy:
 
 ```bash
 docker compose up -d
@@ -501,9 +523,11 @@ docker compose up -d
 - **ner-gliner** — http://localhost:8000 (`/extract`, `/health`, `/metrics`)
 - **Zipkin UI** — http://localhost:9411
 - **Prometheus** — http://localhost:9090
-- **Grafana** — http://localhost:3000 (логин `admin` / пароль `admin`, см. `GF_SECURITY_ADMIN_PASSWORD`), дашборд "GLiNER NER Service" и datasource Prometheus подключены автоматически через [`grafana/provisioning`](grafana/provisioning)
+- **Loki** — http://localhost:3100 (API; своего UI нет, смотреть логи через Grafana Explore)
+- **Alloy** — http://localhost:12345 (UI со статусом компонентов сбора логов)
+- **Grafana** — http://localhost:3000 (логин `admin` / пароль `admin`, см. `GF_SECURITY_ADMIN_PASSWORD`), дашборды "GLiNER NER Service" и datasource'ы Prometheus/Zipkin/Loki подключены автоматически через [`grafana/provisioning`](grafana/provisioning)
 
-Все переменные окружения сервиса (см. таблицу выше) заданы прямо в [`docker-compose.yml`](docker-compose.yml) со значениями по умолчанию; `ZIPKIN_ENDPOINT` указывает на `http://zipkin:9411/api/v2/spans`, чтобы трейсы сразу шли в поднятый Zipkin. Prometheus сконфигурирован через [`prometheus/prometheus.yml`](prometheus/prometheus.yml) и скрейпит `ner-gliner:8000/metrics`. Все три сервиса мониторинга общаются друг с другом по внутренней docker-сети (по именам сервисов), внешние порты используются только для доступа с хоста.
+Все переменные окружения сервиса (см. таблицу выше) заданы прямо в [`docker-compose.yml`](docker-compose.yml) со значениями по умолчанию; `ZIPKIN_ENDPOINT` указывает на `http://zipkin:9411/api/v2/spans`, чтобы трейсы сразу шли в поднятый Zipkin. Prometheus сконфигурирован через [`prometheus/prometheus.yml`](prometheus/prometheus.yml) и скрейпит `ner-gliner:8000/metrics`. Alloy через Docker socket собирает логи **всех** контейнеров стека и отправляет их в Loki — см. раздел "Логи (Loki + Alloy)" выше. Все сервисы мониторинга общаются друг с другом по внутренней docker-сети (по именам сервисов), внешние порты используются только для доступа с хоста.
 
 Остановить и удалить стек:
 
