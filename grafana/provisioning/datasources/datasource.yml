@@ -35,7 +35,7 @@ datasources:
 
         # Другой сервис пишет trace ID в виде "... traceId = 4bf92f3577b34da6a3ce929d0e0e4736 ...".
         - datasourceUid: zipkin
-          matcherRegex: "traceId\\s*=\\s*([0-9a-f]{32})"
+          matcherRegex: "traceId\\s*=\\s*([0-9a-f]{16,32})"
           name: TraceID-eq-format
           url: "$${__value.raw}"
           urlDisplayLabel: "View Trace"

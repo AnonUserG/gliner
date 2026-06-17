@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 FROM --platform=linux/amd64 python:3.10.11-slim
 
 WORKDIR /app
@@ -21,7 +22,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Running both download AND a smoke-test here means a bad checkpoint
 # fails at build time, not at container start.
 # --------------------------------------------------------------------------
-RUN python - << 'PYEOF'
+RUN <<'PYEOF'
+#!/usr/bin/env python
 import sys, time
 from gliner import GLiNER
 
